@@ -1,6 +1,10 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getDb } from '@/lib/db';
 import { getOpenClawClient } from '@/lib/openclaw/client';
+import { generateSoulMd, generateAgentsMd, generateIdentityMd } from '@/lib/openclaw/agent-types';
+
+// OpenClaw workspace path for agent files
+const OPENCLAW_WORKSPACE_PATH = process.env.OPENCLAW_WORKSPACE_PATH || '/data/workspace';
 
 // Helper to extract JSON from a response that might have markdown code blocks or surrounding text
 function extractJSON(text: string): object | null {
@@ -42,14 +46,14 @@ async function getMessagesFromOpenClaw(sessionKey: string): Promise<Array<{ role
     if (!client.isConnected()) {
       await client.connect();
     }
-    
+
     const result = await client.call<{ messages: Array<{ role: string; content: Array<{ type: string; text?: string }> }> }>('chat.history', {
       sessionKey,
       limit: 50,
     });
-    
+
     const messages: Array<{ role: string; content: string }> = [];
-    
+
     for (const msg of result.messages || []) {
       if (msg.role === 'assistant') {
         const textContent = msg.content?.find((c) => c.type === 'text');
@@ -58,7 +62,7 @@ async function getMessagesFromOpenClaw(sessionKey: string): Promise<Array<{ role
         }
       }
     }
-    
+
     return messages;
   } catch (err) {
     console.error('[Planning] Failed to get messages from OpenClaw:', err);
@@ -99,7 +103,7 @@ export async function POST(
     }
 
     // Build the answer message
-    const answerText = answer === 'other' && otherText 
+    const answerText = answer === 'other' && otherText
       ? `Other: ${otherText}`
       : answer;
 
@@ -169,13 +173,13 @@ If planning is complete, respond with JSON:
     let response = null;
     const initialMessages = await getMessagesFromOpenClaw(task.planning_session_key!);
     const initialMsgCount = initialMessages.length;
-    
+
     for (let i = 0; i < 30; i++) {
       await new Promise(resolve => setTimeout(resolve, 500));
 
       const transcriptMessages = await getMessagesFromOpenClaw(task.planning_session_key!);
       console.log('[Planning] Answer poll - API messages:', transcriptMessages.length, 'initial:', initialMsgCount);
-      
+
       // Check if there's a new assistant message
       if (transcriptMessages.length > initialMsgCount) {
         const lastAssistant = [...transcriptMessages].reverse().find(m => m.role === 'assistant');
@@ -225,17 +229,21 @@ If planning is complete, respond with JSON:
 
           // Create the agents in the workspace and track first agent for auto-assign
           let firstAgentId: string | null = null;
-          
+
           if (parsed.agents && parsed.agents.length > 0) {
             const insertAgent = getDb().prepare(`
               INSERT INTO agents (id, workspace_id, name, role, description, avatar_emoji, status, soul_md, created_at, updated_at)
               VALUES (?, (SELECT workspace_id FROM tasks WHERE id = ?), ?, ?, ?, ?, 'standby', ?, datetime('now'), datetime('now'))
             `);
 
+            // Get task info for agent context
+            const taskInfo = getDb().prepare('SELECT title FROM tasks WHERE id = ?').get(taskId) as { title: string } | undefined;
+
             for (const agent of parsed.agents) {
               const agentId = crypto.randomUUID();
               if (!firstAgentId) firstAgentId = agentId;
-              
+
+              // Insert into local DB
               insertAgent.run(
                 agentId,
                 taskId,
@@ -245,6 +253,58 @@ If planning is complete, respond with JSON:
                 agent.avatar_emoji || '🤖',
                 agent.soul_md || ''
               );
+
+              // Create agent in OpenClaw with workspace files
+              try {
+                const client = getOpenClawClient();
+                if (!client.isConnected()) {
+                  await client.connect();
+                }
+
+                // Sanitize agent name for filesystem/API (lowercase, no spaces)
+                const sanitizedAgentName = agent.name.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
+                const agentWorkspace = `${OPENCLAW_WORKSPACE_PATH}/agents/${sanitizedAgentName}`;
+
+                // Generate workspace files
+                const soulMd = generateSoulMd({
+                  name: agent.name,
+                  role: agent.role,
+                  soul_md: agent.soul_md,
+                  instructions: agent.instructions,
+                  avatarEmoji: agent.avatar_emoji,
+                });
+
+                const agentsMd = generateAgentsMd({
+                  name: agent.name,
+                  role: agent.role,
+                  taskTitle: taskInfo?.title,
+                });
+
+                const identityMd = generateIdentityMd({
+                  name: agent.name,
+                  role: agent.role,
+                  avatarEmoji: agent.avatar_emoji,
+                });
+
+                // Create the agent in OpenClaw
+                await client.createAgent({
+                  name: sanitizedAgentName,
+                  workspace: agentWorkspace,
+                  files: [
+                    { filename: 'SOUL.md', content: soulMd },
+                    { filename: 'AGENTS.md', content: agentsMd },
+                    { filename: 'IDENTITY.md', content: identityMd },
+                  ],
+                });
+
+                console.log(`[Planning] Created OpenClaw agent: ${sanitizedAgentName} in ${agentWorkspace}`);
+              } catch (openclawErr) {
+                console.error(`[Planning] Failed to create OpenClaw agent ${agent.name}:`, openclawErr);
+                // Option A: Fail if agent creation fails
+                return NextResponse.json({
+                  error: `Failed to create agent "${agent.name}" in OpenClaw: ${openclawErr instanceof Error ? openclawErr.message : 'Unknown error'}. Please create the agent manually in OpenClaw dashboard.`,
+                }, { status: 500 });
+              }
             }
           }
 
@@ -260,13 +320,13 @@ If planning is complete, respond with JSON:
             // Trigger dispatch - use localhost since we're in the same process
             const dispatchUrl = `http://localhost:${process.env.PORT || 3000}/api/tasks/${taskId}/dispatch`;
             console.log(`[Planning] Triggering dispatch: ${dispatchUrl}`);
-            
+
             try {
               const dispatchRes = await fetch(dispatchUrl, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
               });
-              
+
               if (dispatchRes.ok) {
                 const dispatchData = await dispatchRes.json();
                 console.log(`[Planning] Dispatch successful:`, dispatchData);
@@ -302,7 +362,7 @@ If planning is complete, respond with JSON:
           });
         }
       }
-      
+
       // Response wasn't valid JSON or didn't have expected structure
       getDb().prepare(`
         UPDATE tasks SET planning_messages = ? WHERE id = ?

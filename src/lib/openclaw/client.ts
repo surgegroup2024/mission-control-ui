@@ -21,7 +21,7 @@ export class OpenClawClient extends EventEmitter {
     super();
     this.token = token;
     // Prevent Node.js from throwing on unhandled 'error' events
-    this.on('error', () => {});
+    this.on('error', () => { });
   }
 
   async connect(): Promise<void> {
@@ -267,6 +267,70 @@ export class OpenClawClient extends EventEmitter {
   async describeNode(nodeId: string): Promise<unknown> {
     return this.call('node.describe', { node_id: nodeId });
   }
+
+  // Agent management methods
+  async listAgents(): Promise<Array<{ name: string; workspace: string; isDefault?: boolean }>> {
+    try {
+      const result = await this.call<{ agents: Array<{ name: string; workspace: string; isDefault?: boolean }> }>('agents.list');
+      return result.agents || [];
+    } catch (err) {
+      console.error('[OpenClaw] Failed to list agents:', err);
+      throw err;
+    }
+  }
+
+  async createAgent(params: {
+    name: string;
+    workspace: string;
+    files?: Array<{ filename: string; content: string }>;
+  }): Promise<{ success: boolean; agent?: { name: string; workspace: string } }> {
+    try {
+      console.log(`[OpenClaw] Creating agent: ${params.name} in workspace: ${params.workspace}`);
+
+      // First, create the agent entry
+      const result = await this.call<{ ok: boolean; agent?: { name: string; workspace: string } }>('agents.create', {
+        name: params.name,
+        workspace: params.workspace,
+      });
+
+      // If files are provided, write them to the agent's workspace
+      if (params.files && params.files.length > 0) {
+        for (const file of params.files) {
+          await this.updateAgentFile(params.name, file.filename, file.content);
+        }
+      }
+
+      console.log(`[OpenClaw] Agent created successfully: ${params.name}`);
+      return { success: true, agent: result.agent };
+    } catch (err) {
+      console.error(`[OpenClaw] Failed to create agent ${params.name}:`, err);
+      throw err;
+    }
+  }
+
+  async updateAgentFile(agentName: string, filename: string, content: string): Promise<void> {
+    try {
+      await this.call('agents.writeFile', {
+        agent: agentName,
+        filename,
+        content,
+      });
+      console.log(`[OpenClaw] Updated ${filename} for agent ${agentName}`);
+    } catch (err) {
+      console.error(`[OpenClaw] Failed to update ${filename} for agent ${agentName}:`, err);
+      throw err;
+    }
+  }
+
+  async agentExists(agentName: string): Promise<boolean> {
+    try {
+      const agents = await this.listAgents();
+      return agents.some(a => a.name.toLowerCase() === agentName.toLowerCase());
+    } catch {
+      return false;
+    }
+  }
+
 
   disconnect(): void {
     this.autoReconnect = false;
